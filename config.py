@@ -34,18 +34,20 @@ GOLD = (255,215,0)
 DARK_GREY = (50,50,50)
 ORANGE = (255, 165, 0)
 
-
 FOOD_SPAWN_MARGIN = 50
 
-# Grid background settings
-# Grid cell size is specified in centimeters (visual target). We convert to pixels
-# using a default DPI; you can tweak GRID_DEFAULT_DPI if your display reports different scaling.
 GRID_CM = 2
 GRID_DEFAULT_DPI = 96
-# Pixels per grid cell (approx)
 GRID_CELL_PX = max(8, int((GRID_DEFAULT_DPI / 2.54) * GRID_CM))
-# Grid colors and animation speed (pixels per second)
 GRID_LINE_COLOR = (28, 28, 28)
 GRID_MAJOR_LINE_COLOR = (44, 44, 44)
 GRID_MAJOR_EVERY = 5
-GRID_SCROLL_SPEED = 12  # px/sec, small scrolling motion to make grid 'running'
+GRID_SCROLL_SPEED = 12
+
+INFO_PANEL_WIDTH = 260
+
+CAMERA_MIRROR = True
+
+INFO_PANEL_COLOR = (70, 70, 70)
+
+CAMERA_MIRROR_TEXT_ONLY = False

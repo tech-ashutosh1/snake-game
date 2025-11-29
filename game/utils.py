@@ -17,11 +17,32 @@ class FingerSnakeGame:
 
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((GAME_WIDTH, GAME_HEIGHT))
+        # Window includes game board (GAME_WIDTH) plus an information panel on the right
+        total_width = GAME_WIDTH + INFO_PANEL_WIDTH
+        self.screen = pygame.display.set_mode((total_width, GAME_HEIGHT))
         pygame.display.set_caption("Finger-Controlled Snake")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 36)
         self.small_font = pygame.font.Font(None, 24)
+        # Tiny font for compact labels inside camera preview
+        self.tiny_font = pygame.font.Font(None, 18)
+        # Slightly smaller font specifically for the INDEX label
+        # (make it smaller than tiny_font so it's less obtrusive)
+        self.index_font = pygame.font.Font(None, 14)
+        # Monospaced tiny font for the NO HAND message. Use SysFont to pick a
+        # monospace face available on the system; fall back to tiny_font if
+        # SysFont is not available.
+        try:
+            # Request a bold monospace font so the "NO HAND DETECTED" message
+            # appears emphasized in the camera preview.
+            self.mono_tiny_font = pygame.font.SysFont('monospace', 14, bold=True)
+        except Exception:
+            self.mono_tiny_font = self.tiny_font
+            try:
+                # If fallback font supports bolding, enable it to match intent.
+                self.mono_tiny_font.set_bold(True)
+            except Exception:
+                pass
 
         # Game objects
         self.snake = Snake()
@@ -54,6 +75,9 @@ class FingerSnakeGame:
 
         self.frame_lock = threading.Lock()
         self.latest_frame_small = None
+        self.latest_overlay_text = None
+        self.latest_overlay_pos = None
+        self.latest_overlay_detected = False
         self.shared_finger_pos = None
         self.shared_finger_detected = False
 
@@ -76,6 +100,8 @@ class FingerSnakeGame:
         # UI / control flags
         self.paused = False
         self.muted = False
+        # Exit confirmation flag — when True, user must confirm quit with Y
+        self.exit_confirmation = False
 
         # High score persistence
         self.highscore_file = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'highscore.json'))
@@ -123,7 +149,9 @@ class FingerSnakeGame:
     def map_coordinates(self, camera_pos):
         """Map camera coordinates to game coordinates."""
         x, y = camera_pos
-        x = CAMERA_WIDTH - x if CAMERA_WIDTH else x # Mirror the x-axis
+        # Mirror only if configured to do so (keeps mapping consistent with preview)
+        if 'CAMERA_MIRROR' in globals() and CAMERA_MIRROR and CAMERA_WIDTH:
+            x = CAMERA_WIDTH - x
         game_x = int(x * GAME_WIDTH / CAMERA_WIDTH) if CAMERA_WIDTH else int(x)
         game_y = int(y * GAME_HEIGHT / CAMERA_HEIGHT) if CAMERA_HEIGHT else int(y)
         # Clamp to game boundaries
@@ -171,8 +199,8 @@ class FingerSnakeGame:
                 time.sleep(0.01)
                 continue
 
-            # Hand tracking
-            finger_pos, detected, processed_frame = self.hand_tracker.find_finger_position(frame)
+            # Hand tracking (do not draw labels here; we'll render labels in pygame)
+            finger_pos, detected, processed_frame = self.hand_tracker.find_finger_position(frame, draw_labels=False)
             
             game_pos = None
             if detected and finger_pos:
@@ -180,13 +208,40 @@ class FingerSnakeGame:
                 # Note: Smoothing applied here, then shared
                 game_pos = self.smooth_position(game_pos) 
 
+            # Prepare overlay text + position (in small frame coordinates)
+            h, w, _ = frame.shape
+            small_w, small_h = (240, 180)
+            overlay_text = None
+            overlay_pos_small = None
+            if detected and finger_pos is not None:
+                x, y = finger_pos
+                overlay_text = "INDEX"
+                x_small = int(x * small_w / w)
+                y_small = int(y * small_h / h)
+                # If the preview is being flipped for full mirroring, mirror the
+                # overlay position so the label follows what the user sees on-screen.
+                if 'CAMERA_MIRROR' in globals() and CAMERA_MIRROR and not ('CAMERA_MIRROR_TEXT_ONLY' in globals() and CAMERA_MIRROR_TEXT_ONLY):
+                    x_small = small_w - x_small
+                overlay_pos_small = (x_small, y_small)
+            else:
+                # Draw NO HAND DETECTED inside the camera preview at its top-left
+                overlay_text = "NO HAND DETECTED"
+                overlay_pos_small = (8, 8)
+
             with self.frame_lock:
                 self.shared_finger_pos = game_pos
                 self.shared_finger_detected = detected
+                self.latest_overlay_text = overlay_text
+                self.latest_overlay_pos = overlay_pos_small
+                self.latest_overlay_detected = detected
 
-            # Update display frame with landmarks drawn
-            frame_flip = cv2.flip(processed_frame, 1)
-            frame_small = cv2.resize(frame_flip, (240, 180))
+            # Update display frame with landmarks drawn. Respect CAMERA_MIRROR.
+            if 'CAMERA_MIRROR' in globals() and CAMERA_MIRROR:
+                preview_frame = cv2.flip(processed_frame, 1)
+            else:
+                preview_frame = processed_frame
+            # Scale preview to a compact size for the info panel
+            frame_small = cv2.resize(preview_frame, (240, 180))
             with self.frame_lock:
                 self.latest_frame_small = frame_small
 
@@ -197,12 +252,19 @@ class FingerSnakeGame:
         frame_small = None
         finger_pos = None
         finger_detected = False
+        overlay_text = None
+        overlay_pos = None
+        overlay_detected = False
 
         with self.frame_lock:
             if self.latest_frame_small is not None:
                 frame_small = self.latest_frame_small.copy()
             finger_pos = self.shared_finger_pos
             finger_detected = self.shared_finger_detected
+            # Grab overlay info set by camera thread
+            overlay_text = self.latest_overlay_text
+            overlay_pos = self.latest_overlay_pos
+            overlay_detected = self.latest_overlay_detected
 
         self.finger_detected = finger_detected
         if finger_pos is not None:
@@ -211,6 +273,45 @@ class FingerSnakeGame:
         if frame_small is not None:
             frame_rgb = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
             self.camera_surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+            # Draw overlay text onto the camera preview using pygame so we can
+            # control mirroring of the labels independently of the image.
+            try:
+                if overlay_text:
+                    # small preview surface coordinates
+                    surf_w = self.camera_surface.get_width()
+                    surf_h = self.camera_surface.get_height()
+
+                    # Render label:
+                    label_color = GREEN if overlay_detected else RED
+                    if overlay_text == "INDEX":
+                        # use the slightly smaller index font to be less obtrusive
+                        label_surf = self.index_font.render(overlay_text, True, label_color)
+                    elif overlay_text == "NO HAND DETECTED":
+                        # monospaced, smaller message so it fits nicely in the
+                        # camera preview top-left
+                        try:
+                            label_surf = self.mono_tiny_font.render(overlay_text, True, RED)
+                        except Exception:
+                            label_surf = self.tiny_font.render(overlay_text, True, RED)
+                    else:
+                        label_surf = self.small_font.render(overlay_text, True, label_color)
+                    label_rect = label_surf.get_rect()
+
+                    if overlay_pos:
+                        px, py = overlay_pos
+                    else:
+                        px, py = (10, 24)
+
+                    # If configured to mirror only text, flip text surface horizontally
+                    if 'CAMERA_MIRROR_TEXT_ONLY' in globals() and CAMERA_MIRROR_TEXT_ONLY:
+                        label_surf = pygame.transform.flip(label_surf, True, False)
+
+                    # Blit label — keep inside preview bounds
+                    blit_x = max(0, min(surf_w - label_rect.width, px))
+                    blit_y = max(0, min(surf_h - label_rect.height, py))
+                    self.camera_surface.blit(label_surf, (blit_x, blit_y))
+            except Exception:
+                pass
 
     def draw_text(self, text, pos, color=WHITE, font=None):
         """Draw text on screen."""
@@ -225,8 +326,17 @@ class FingerSnakeGame:
 
         Uses GRID_CELL_PX from config to determine spacing and GRID_SCROLL_SPEED to animate.
         """
-        # Fill base
-        self.screen.fill(BLACK)
+        # Fill base only within game area; clear info panel separately
+        # Game area background
+        game_area = pygame.Rect(0, 0, GAME_WIDTH, GAME_HEIGHT)
+        self.screen.fill(BLACK, game_area)
+        # Info panel background (use configured INFO_PANEL_COLOR)
+        info_area = pygame.Rect(GAME_WIDTH, 0, INFO_PANEL_WIDTH, GAME_HEIGHT)
+        try:
+            self.screen.fill(INFO_PANEL_COLOR, info_area)
+        except Exception:
+            # Fallback if INFO_PANEL_COLOR isn't defined
+            self.screen.fill((10, 10, 10), info_area)
 
         cell = GRID_CELL_PX
         if cell <= 0:
@@ -236,22 +346,32 @@ class FingerSnakeGame:
         t = time.time()
         offset = int((t * GRID_SCROLL_SPEED) % cell)
 
-        # Vertical lines
-        for i, x in enumerate(range(-offset, GAME_WIDTH + cell, cell)):
-            # Major every GRID_MAJOR_EVERY
-            if (i % GRID_MAJOR_EVERY) == 0:
-                color = GRID_MAJOR_LINE_COLOR
-            else:
-                color = GRID_LINE_COLOR
-            pygame.draw.line(self.screen, color, (x, 0), (x, GAME_HEIGHT))
+        # Restrict drawing to the game area so the grid doesn't bleed into
+        # the info panel. Use a clip rect for safety across different
+        # backends and to avoid off-by-one drawing at the game/info border.
+        prev_clip = self.screen.get_clip()
+        try:
+            self.screen.set_clip(game_area)
 
-        # Horizontal lines
-        for i, y in enumerate(range(-offset, GAME_HEIGHT + cell, cell)):
-            if (i % GRID_MAJOR_EVERY) == 0:
-                color = GRID_MAJOR_LINE_COLOR
-            else:
-                color = GRID_LINE_COLOR
-            pygame.draw.line(self.screen, color, (0, y), (GAME_WIDTH, y))
+            # Vertical lines (only within the game area)
+            for i, x in enumerate(range(-offset, GAME_WIDTH, cell)):
+                # Major every GRID_MAJOR_EVERY
+                if (i % GRID_MAJOR_EVERY) == 0:
+                    color = GRID_MAJOR_LINE_COLOR
+                else:
+                    color = GRID_LINE_COLOR
+                pygame.draw.line(self.screen, color, (x, 0), (x, GAME_HEIGHT))
+
+            # Horizontal lines (only within the game area)
+            for i, y in enumerate(range(-offset, GAME_HEIGHT, cell)):
+                if (i % GRID_MAJOR_EVERY) == 0:
+                    color = GRID_MAJOR_LINE_COLOR
+                else:
+                    color = GRID_LINE_COLOR
+                pygame.draw.line(self.screen, color, (0, y), (GAME_WIDTH, y))
+        finally:
+            # Restore previous clipping region
+            self.screen.set_clip(prev_clip)
 
     def draw_menu(self):
         """Draw menu screen."""
@@ -287,32 +407,37 @@ class FingerSnakeGame:
         
     def draw_hud(self):
         """Draw heads-up display."""
+        # Draw HUD into the info panel (right side)
+        base_x = GAME_WIDTH + 10
+        current_y = 10
         score_text = self.small_font.render(f"Score: {self.score}", True, WHITE)
-        self.screen.blit(score_text, (10, 10))
+        self.screen.blit(score_text, (base_x, current_y))
+        current_y += score_text.get_height() + 8
         
         # Draw Speed Boost Timer
         if time.time() < self.snake.speed_boost_end_time:
             time_left = self.snake.speed_boost_end_time - time.time()
             boost_text = self.small_font.render(f"BOOST: {time_left:.1f}s", True, GOLD)
-            self.screen.blit(boost_text, (10, 70))
+            self.screen.blit(boost_text, (base_x, 70))
 
         status_color = GREEN if self.finger_detected else RED
         status_text = self.small_font.render(
             "Finger: " + ("Detected" if self.finger_detected else "Not Found"),
             True, status_color
         )
-        self.screen.blit(status_text, (10, 40))
+        self.screen.blit(status_text, (base_x, current_y))
+        current_y += status_text.get_height() + 8
 
         fps_text = self.small_font.render(f"FPS: {int(self.clock.get_fps())}", True, WHITE)
-        self.screen.blit(fps_text, (10, GAME_HEIGHT - 30))
-        # High score display
+        self.screen.blit(fps_text, (base_x, GAME_HEIGHT - 30))
+        # High score display (aligned to right of info panel)
         hs_text = self.small_font.render(f"High: {self.highscore}", True, WHITE)
-        self.screen.blit(hs_text, (GAME_WIDTH - 110, 10))
+        self.screen.blit(hs_text, (GAME_WIDTH + INFO_PANEL_WIDTH - 110, 10))
 
         # Mute / Pause indicator
         if self.muted:
             mute_text = self.small_font.render("MUTED", True, RED)
-            self.screen.blit(mute_text, (GAME_WIDTH - 110, 40))
+            self.screen.blit(mute_text, (GAME_WIDTH + INFO_PANEL_WIDTH - 110, 40))
         if self.paused:
             pause_text = self.font.render("PAUSED", True, YELLOW)
             pause_rect = pause_text.get_rect(center=(GAME_WIDTH//2, GAME_HEIGHT//2))
@@ -323,6 +448,18 @@ class FingerSnakeGame:
         # Draw a thick gray border that acts as the wall
         border_rect = (0, 0, GAME_WIDTH, GAME_HEIGHT)
         pygame.draw.rect(self.screen, DARK_GREY, border_rect, WALL_COLLISION_MARGIN)
+
+    def draw_game_fps(self):
+        """Draw FPS counter in the bottom-left of the game area."""
+        try:
+            fps = int(self.clock.get_fps())
+            fps_surf = self.small_font.render(f"FPS: {fps}", True, WHITE)
+            # small padding from left and bottom edges
+            x = 8
+            y = GAME_HEIGHT - fps_surf.get_height() - 8
+            self.screen.blit(fps_surf, (x, y))
+        except Exception:
+            pass
 
     def run(self):
         """Main game loop."""
@@ -335,19 +472,76 @@ class FingerSnakeGame:
                 if event.type == pygame.QUIT:
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
-                    # Allow quitting with ESC or 'q' key
+                    # Handle key presses on KEYDOWN to make toggle actions
+                    # (pause/mute/quit confirmation) respond to a single press.
+
+                    # If exit confirmation dialog is active, handle Y/N/Esc on keydown
+                    if self.exit_confirmation:
+                        if event.key == pygame.K_y:
+                            print('\n\nExit confirmed by user.')
+                            self.running = False
+                        elif event.key == pygame.K_n or event.key == pygame.K_ESCAPE:
+                            # Cancel exit
+                            self.exit_confirmation = False
+                        # ignore other keys while confirming
+                        continue
+
+                    # If not confirming, handle primary controls on KEYDOWN
+                    # Allow quitting with ESC or 'q' key — ask for confirmation
                     if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
-                        print('\n\nExiting ...!!!')
-                        self.running = False
-                    # Pause / Resume
-                    elif event.key == pygame.K_p:
+                        # Activate confirmation overlay rather than quitting immediately
+                        self.exit_confirmation = True
+                        continue
+                    # Pause / Resume (toggle on single press)
+                    elif event.key == pygame.K_p or event.key == pygame.K_SPACE:
                         self.paused = not self.paused
-                    # Mute / Unmute
+                        continue
+                    # Mute / Unmute (toggle on single press)
                     elif event.key == pygame.K_m:
                         self.muted = not self.muted
+                        continue
+                # Ignore KEYUP for control toggles to prevent double-toggling
+                elif event.type == pygame.KEYUP:
+                    pass
 
             self.update_from_shared_state()
-            
+
+            # If exit confirmation is active we should pause game updates
+            # and render a static frame with the confirmation modal on top.
+            if self.exit_confirmation:
+                # Draw background + HUD + camera preview but do NOT advance game logic
+                self.draw_background()
+                self.draw_border()
+                # Draw HUD (info panel)
+                self.draw_hud()
+                # Draw camera preview if available
+                if self.camera_surface is not None:
+                    cam_width = self.camera_surface.get_width()
+                    cam_height = self.camera_surface.get_height()
+                    cam_x = GAME_WIDTH + 10
+                    cam_y = GAME_HEIGHT - cam_height - 10
+                    self.screen.blit(self.camera_surface, (cam_x, cam_y))
+
+                    # Draw confirmation modal centered over game area
+                try:
+                    overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT), pygame.SRCALPHA)
+                    overlay.fill((0, 0, 0, 160))
+                    self.screen.blit(overlay, (0, 0))
+                    msg = "Quit? Press Y to confirm, N or Esc to cancel"
+                    text_surf = self.small_font.render(msg, True, WHITE)
+                    text_rect = text_surf.get_rect(center=(GAME_WIDTH // 2, GAME_HEIGHT // 2))
+                    pad = 12
+                    box_rect = pygame.Rect(text_rect.left - pad, text_rect.top - pad,
+                                            text_rect.width + pad * 2, text_rect.height + pad * 2)
+                    pygame.draw.rect(self.screen, (40, 40, 40), box_rect, border_radius=6)
+                    self.screen.blit(text_surf, text_rect)
+                except Exception:
+                    pass
+
+                pygame.display.flip()
+                self.clock.tick(FPS)
+                continue
+
             # Draw game border first
             self.draw_border()
 
@@ -382,7 +576,14 @@ class FingerSnakeGame:
                     if self.camera_surface is not None:
                         cam_width = self.camera_surface.get_width()
                         cam_height = self.camera_surface.get_height()
-                        self.screen.blit(self.camera_surface, (GAME_WIDTH - cam_width - 10, GAME_HEIGHT - cam_height - 10))
+                        # Place camera preview inside the info panel
+                        cam_x = GAME_WIDTH + 10
+                        cam_y = GAME_HEIGHT - cam_height - 10
+                        self.screen.blit(self.camera_surface, (cam_x, cam_y))
+                    # Draw FPS in bottom-left of game area when paused
+                    self.draw_game_fps()
+                    # Draw FPS in bottom-left when showing confirmation modal
+                    self.draw_game_fps()
                     pygame.display.flip()
                     self.clock.tick(FPS)
                     continue
@@ -489,8 +690,33 @@ class FingerSnakeGame:
             if self.camera_surface is not None:
                 cam_width = self.camera_surface.get_width()
                 cam_height = self.camera_surface.get_height()
-                self.screen.blit(self.camera_surface, (GAME_WIDTH - cam_width - 10, GAME_HEIGHT - cam_height - 10))
+                # Place camera preview inside the info panel (left-aligned)
+                cam_x = GAME_WIDTH + 10
+                cam_y = GAME_HEIGHT - cam_height - 10
+                self.screen.blit(self.camera_surface, (cam_x, cam_y))
+            # If exit confirmation is active, draw a modal confirmation overlay
+            if self.exit_confirmation:
+                try:
+                    overlay = pygame.Surface((GAME_WIDTH, GAME_HEIGHT), pygame.SRCALPHA)
+                    overlay.fill((0, 0, 0, 160))  # semi-transparent dark overlay
+                    self.screen.blit(overlay, (0, 0))
 
+                    msg = "Quit? Press Y to confirm, N or Esc to cancel"
+                    # Use small font so it fits across different resolutions
+                    text_surf = self.small_font.render(msg, True, WHITE)
+                    text_rect = text_surf.get_rect(center=(GAME_WIDTH // 2, GAME_HEIGHT // 2))
+                    # Draw a slightly brighter box behind the text for clarity
+                    pad = 12
+                    box_rect = pygame.Rect(text_rect.left - pad, text_rect.top - pad,
+                                            text_rect.width + pad * 2, text_rect.height + pad * 2)
+                    pygame.draw.rect(self.screen, (40, 40, 40), box_rect, border_radius=6)
+                    self.screen.blit(text_surf, text_rect)
+                except Exception:
+                    # If anything goes wrong drawing the overlay, still allow exit
+                    pass
+
+            # Draw FPS in bottom-left of the game area
+            self.draw_game_fps()
             pygame.display.flip()
             self.clock.tick(FPS)
 

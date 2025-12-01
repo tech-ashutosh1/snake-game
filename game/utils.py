@@ -1,3 +1,4 @@
+import builtins
 import pygame
 import threading
 import cv2
@@ -104,7 +105,13 @@ class FingerSnakeGame:
         self.exit_confirmation = False
 
         # High score persistence
-        self.highscore_file = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'highscore.json'))
+        
+        if hasattr(builtins, "resource_path"):
+            self.highscore_file = builtins.resource_path("highscore.json")
+        else:
+            # Fallback for dev mode
+            self.highscore_file = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'highscore.json'))
+
         self.highscore = self._load_highscore()
 
         # Audio: prepare simple SFX (generated) — guarded in case mixer isn't available
